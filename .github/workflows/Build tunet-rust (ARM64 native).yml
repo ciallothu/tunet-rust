@@ -1,38 +1,21 @@
-name: Build tunet-rust (ARM64 native)
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-  pull_request:
-
+# .github/workflows/build-arm64.yml
+name: Build tunet-rust (ARM64 CLI-only)
+on: [push, pull_request, workflow_dispatch]
 jobs:
   build-arm64:
-    runs-on: ubuntu-24.04-arm  # 原生 ARM64 runner
+    runs-on: ubuntu-24.04-arm   # 原生 ARM64 runner
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install deps (OpenSSL & build tools)
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
+      - name: Build CLI only
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev
-
-      - name: Build (native aarch64)
-        run: |
-          cargo build --release --workspace --exclude native
-
-      - name: Package artifacts
-        run: |
-          mkdir -p dist
-          cp target/release/tunet dist/tunet-aarch64
-          ls -lh dist
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+          # 只编 CLI，不编 GUI（避免拉上 Qt）
+          cargo build --release -p tunet -p tunet-service
+      - uses: actions/upload-artifact@v4
         with:
-          name: tunet-aarch64
-          path: dist/
+          name: tunet-aarch64-cli
+          path: |
+            target/release/tunet
+            target/release/tunet-service
