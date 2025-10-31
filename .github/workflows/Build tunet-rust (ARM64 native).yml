@@ -1,163 +1,81 @@
-name: Build tunet-rust for OpenWrt (MT7981 aarch64_cortex-a53)
+name: "Build tunet-rust (ARM64 native)"
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
     tags: [ "v*" ]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
-  # 选用 OpenWrt 23.05.0 mediatek/filogic SDK（适配 MT7981 / aarch64_cortex-a53）
-  OPENWRT_SDK_URL: "https://downloads.openwrt.org/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
 
 jobs:
-  build-openwrt-mt7981:
-    runs-on: ubuntu-24.04
+  build-arm64-qt5:
+    name: "ARM64 (Ubuntu 22.04) Qt5 build"
+    runs-on: ubuntu-22.04-arm
 
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: Cache Cargo (registry/git/target)
+      - name: "Cache Cargo registry/git/target"
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-arm64-cargo-
 
-      - name: Install host deps
+      - name: "Set up Rust (stable)"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Install build dependencies (OpenSSL, Qt5, toolchain)"
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential wget curl xz-utils tar rsync \
-            python3 pkg-config cmake ninja-build perl \
-            git unzip jq coreutils file
+          sudo apt-get install -y \
+            build-essential pkg-config libssl-dev \
+            qtbase5-dev qtbase5-dev-tools qtchooser qt5-qmake \
+            qttools5-dev qttools5-dev-tools \
+            libgl1-mesa-dev
+          qmake -v || true
+          which qmake || true
 
-      - name: Set up Rust (stable) + musl target
-        run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          rustup target add aarch64-unknown-linux-musl
-          rustc -V && cargo -V
-
-      - name: Download & extract OpenWrt SDK
-        run: |
-          mkdir -p openwrt-sdk
-          wget -q "${OPENWRT_SDK_URL}" -O sdk.tar.xz
-          tar -C openwrt-sdk --strip-components=1 -xf sdk.tar.xz
-          rm -f sdk.tar.xz
-          ls -lah openwrt-sdk
-
-      - name: Prepare SDK feeds and defconfig
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        run: |
-          ./scripts/feeds update -a
-          # 只装我们需要的也可以：./scripts/feeds install openssl
-          ./scripts/feeds install -a
-          make defconfig
-
-      - name: Build OpenSSL into staging_dir
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        run: |
-          # 正确目标：package/libs/openssl/compile
-          make package/libs/openssl/compile V=s
-
-          echo "== Staging dirs =="
-          ls -d $PWD/staging_dir/toolchain-* || true
-          ls -d $PWD/staging_dir/target-*    || true
-
-      - name: Export SDK toolchain env
-        id: sdk
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDK="$PWD"
-          TOOLCHAIN_DIR=$(ls -d $SDK/staging_dir/toolchain-* | head -n1)
-          TARGET_DIR=$(ls -d $SDK/staging_dir/target-*    | head -n1)
-          echo "toolchain=$TOOLCHAIN_DIR" >> $GITHUB_OUTPUT
-          echo "target=$TARGET_DIR"       >> $GITHUB_OUTPUT
-          echo "cc=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-gcc" >> $GITHUB_OUTPUT
-          echo "ar=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-ar"   >> $GITHUB_OUTPUT
-          echo "strip=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-strip" >> $GITHUB_OUTPUT
-          echo "pkgcfg=$TOOLCHAIN_DIR/bin/pkg-config"                  >> $GITHUB_OUTPUT
-          echo "pcpath=$TARGET_DIR/usr/lib/pkgconfig:$TARGET_DIR/usr/share/pkgconfig" >> $GITHUB_OUTPUT
-          echo "sysroot=$TARGET_DIR"        >> $GITHUB_OUTPUT
-          echo "openssl_dir=$TARGET_DIR/usr" >> $GITHUB_OUTPUT
-
-      - name: Configure Cargo for cross (aarch64-unknown-linux-musl)
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<CFG
-          [target.aarch64-unknown-linux-musl]
-          linker = "${{ steps.sdk.outputs.cc }}"
-          ar     = "${{ steps.sdk.outputs.ar }}"
-          # 确保使用 SDK 的 sysroot
-          rustflags = ["-C", "link-arg=--sysroot=${{ steps.sdk.outputs.sysroot }}"]
-          CFG
-          echo "---- .cargo/config.toml ----"
-          cat .cargo/config.toml
-
-      - name: Build (CLI only: tunet + tunet-service)
+      # 让 winio-ui-qt 的 build.rs 明确找到 Qt5 的 qmake
+      - name: "Build (Qt5 + whole workspace, exclude native)"
         env:
-          PKG_CONFIG_ALLOW_CROSS: "1"
-          PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
-          PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
-          PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
-          OPENSSL_DIR: "${{ steps.sdk.outputs.openssl_dir }}"
-          OPENSSL_LIB_DIR: "${{ steps.sdk.outputs.openssl_dir }}/lib"
-          OPENSSL_INCLUDE_DIR: "${{ steps.sdk.outputs.openssl_dir }}/include"
-          # 可选：尽量静态化 C 运行时（OpenWrt 上更稳）
-          RUSTFLAGS: "-C target-feature=+crt-static"
+          QT_VERSION_MAJOR: "5"
+          QMAKE: qmake
+          RUST_BACKTRACE: "1"
         run: |
-          # 仅构建 CLI（不包含 Qt GUI），更适合路由器
-          cargo build --release --target aarch64-unknown-linux-musl \
-            -p tunet -p tunet-service
+          cargo build --release --workspace --exclude native
 
-      - name: Collect, strip, checksum
-        shell: bash
+      - name: "Strip & package"
         run: |
           mkdir -p dist
-          cp target/aarch64-unknown-linux-musl/release/tunet         dist/tunet-openwrt-aarch64
-          cp target/aarch64-unknown-linux-musl/release/tunet-service dist/tunet-service-openwrt-aarch64
-
-          echo "Before strip:"
-          file dist/* || true
+          # 挑出 release 目录下的可执行文件
+          find target/release -maxdepth 1 -type f -executable -exec file {} \; \
+            | awk -F: '/ELF 64-bit LSB executable/ {print $1}' \
+            | while read -r bin; do
+                cp "$bin" "dist/$(basename "$bin")-aarch64"
+              done
+          # strip（可选）
+          command -v strip >/dev/null 2>&1 && strip dist/*-aarch64 || true
           ls -lh dist
-
-          # 使用 SDK 的 strip
-          "${{ steps.sdk.outputs.strip }}" dist/tunet-openwrt-aarch64 || true
-          "${{ steps.sdk.outputs.strip }}" dist/tunet-service-openwrt-aarch64 || true
-
-          echo "After strip:"
-          ls -lh dist
-
-          # 生成校验
           (cd dist && sha256sum * > SHA256SUMS.txt)
           echo "---- SHA256SUMS ----"
           cat dist/SHA256SUMS.txt
 
-          # 附带 README
-          cat > dist/README.txt <<'TXT'
-          tunet / tunet-service (OpenWrt MT7981 aarch64_cortex-a53, musl)
-          - Built with OpenWrt 23.05.0 mediatek/filogic SDK
-          - Target triple: aarch64-unknown-linux-musl
-          - Recommended to run on OpenWrt 23.05.x MT7981 devices
-          TXT
-
-      - name: Upload artifacts
+      - name: "Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
-          name: tunet-openwrt-mt7981-aarch64
+          name: tunet-rust-arm64-qt5
           path: dist/
 
-      - name: Release (on tag)
+      - name: "Release (on tag)"
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
