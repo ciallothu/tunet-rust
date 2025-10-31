@@ -9,7 +9,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # 你的路由器是 OpenWrt 23.05.0 / mediatek/mt7981（filogic 目标）
   OPENWRT_SDK_URL: "https://downloads.openwrt.org/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
 
 jobs:
@@ -54,21 +53,43 @@ jobs:
           rm -f sdk.tar.xz
           ls -lah openwrt-sdk
 
-      - name: "Prepare SDK (feeds + defconfig)"
+      # 只做 defconfig；不要 install -a 以免拉到不匹配的 feeds 触发递归依赖
+      - name: "SDK defconfig (no full feeds install)"
         working-directory: ${{ github.workspace }}/openwrt-sdk
         run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          ./scripts/feeds update -a || true    # 允许失败/网络波动；SDK 自带 package/ 树
           make defconfig
 
-      - name: "Build OpenSSL into staging_dir"
+      # 智能定位 openssl 目标；找不到就 fall back 到 vendored OpenSSL
+      - name: "Build OpenSSL into staging_dir (smart)"
+        id: openssl
         working-directory: ${{ github.workspace }}/openwrt-sdk
+        shell: bash
         run: |
-          # 关键：正确目标是 package/libs/openssl/compile
-          make package/libs/openssl/compile V=s
-          echo "== Staging dirs =="
-          ls -d $PWD/staging_dir/toolchain-* || true
-          ls -d $PWD/staging_dir/target-*    || true
+          set -euo pipefail
+          SDK="$PWD"
+
+          CORE_MK="$SDK/package/libs/openssl/Makefile"
+          FEEDS_MK="$SDK/feeds/packages/libs/openssl/Makefile"
+
+          TARGET=""
+          if [[ -f "$CORE_MK" ]]; then
+            TARGET="package/libs/openssl/compile"
+          elif [[ -f "$FEEDS_MK" ]]; then
+            TARGET="package/feeds/packages/openssl/compile"
+          fi
+
+          if [[ -n "$TARGET" ]]; then
+            echo "Using target: $TARGET"
+            make -j1 V=s "$TARGET"
+            echo "mode=staging" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::OpenSSL package not found in SDK (core/feeds). Will use openssl-sys vendored mode."
+            echo "mode=vendored" >> $GITHUB_OUTPUT
+          fi
+
+          ls -d $SDK/staging_dir/toolchain-* || true
+          ls -d $SDK/staging_dir/target-*    || true
 
       - name: "Export SDK toolchain env"
         id: sdk
@@ -103,20 +124,31 @@ jobs:
 
       - name: "Build (CLI only: tunet + tunet-service)"
         env:
+          # 交叉构建公共设置
           PKG_CONFIG_ALLOW_CROSS: "1"
           PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
           PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
           PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+          # 如果上一阶段成功把 openssl 装进 staging_dir，就用它；
+          # 否则自动切换到 openssl-sys vendored
           OPENSSL_DIR: "${{ steps.sdk.outputs.openssl_dir }}"
           OPENSSL_LIB_DIR: "${{ steps.sdk.outputs.openssl_dir }}/lib"
           OPENSSL_INCLUDE_DIR: "${{ steps.sdk.outputs.openssl_dir }}/include"
-          # 可选：尽量静态化 C 运行时（OpenWrt 上更稳）
-          RUSTFLAGS: "-C target-feature=+crt-static"
+          OPENSSL_STATIC: ${{ steps.openssl.outputs.mode == 'staging' && '0' || '1' }}
+          OPENSSL_NO_VENDOR: ${{ steps.openssl.outputs.mode == 'staging' && '1' || '0' }}
         run: |
+          if [[ "${{ steps.openssl.outputs.mode }}" == "vendored" ]]; then
+            echo "== Using openssl-sys vendored mode =="
+          else
+            echo "== Using SDK staged OpenSSL =="
+          fi
+
           cargo build --release --target aarch64-unknown-linux-musl \
             -p tunet -p tunet-service
 
-      - name: "Collect & package artifacts (robust)"
+      - name: "Collect & package artifacts"
         shell: bash
         run: |
           set -euo pipefail
@@ -150,6 +182,7 @@ jobs:
           tunet / tunet-service for OpenWrt (MT7981 aarch64_cortex-a53, musl)
           - Built with OpenWrt 23.05.0 mediatek/filogic SDK
           - Target: aarch64-unknown-linux-musl
+          - OpenSSL: SDK staged OR openssl-sys vendored (auto)
           TXT
 
       - name: "Upload artifacts"
