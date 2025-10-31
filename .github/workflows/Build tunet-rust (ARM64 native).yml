@@ -9,53 +9,70 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # 选用 OpenWrt 23.05.0 mediatek/filogic SDK（适配 MT7981 / aarch64_cortex-a53）
+  OPENWRT_SDK_URL: "https://downloads.openwrt.org/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
 
 jobs:
   build-openwrt-mt7981:
-    # 用 x86_64 主机跑 OpenWrt 官方 SDK（SDK 本身就是 x86_64 Linux）
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache Cargo (registry/git/target)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: Install host deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential wget tar xz-utils \
-              python3 pkg-config cmake ninja-build \
-              musl-tools git curl unzip
+          sudo apt-get install -y --no-install-recommends \
+            build-essential wget curl xz-utils tar rsync \
+            python3 pkg-config cmake ninja-build perl \
+            git unzip jq coreutils file
 
-      - name: Download OpenWrt SDK (23.05.0 mediatek/filogic)
+      - name: Set up Rust (stable) + musl target
         run: |
-          # 任选一个镜像；这里用 C3SL 镜像（与官方目录一致）
-          SDK_URL="https://openwrt.c3sl.ufpr.br/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          wget -q $SDK_URL -O sdk.tar.xz
-          mkdir -p $GITHUB_WORKSPACE/openwrt-sdk
-          tar -C $GITHUB_WORKSPACE/openwrt-sdk --strip-components=1 -xf sdk.tar.xz
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          rustup target add aarch64-unknown-linux-musl
+          rustc -V && cargo -V
+
+      - name: Download & extract OpenWrt SDK
+        run: |
+          mkdir -p openwrt-sdk
+          wget -q "${OPENWRT_SDK_URL}" -O sdk.tar.xz
+          tar -C openwrt-sdk --strip-components=1 -xf sdk.tar.xz
           rm -f sdk.tar.xz
+          ls -lah openwrt-sdk
 
-      - name: Show SDK tree
-        run: |
-          ls -lah $GITHUB_WORKSPACE/openwrt-sdk
-          echo "OpenWrt SDK ready"
-
-      - name: Prepare SDK & build OpenSSL for staging
+      - name: Prepare SDK feeds and defconfig
         working-directory: ${{ github.workspace }}/openwrt-sdk
         run: |
-          # 让 SDK 生成默认 .config（避免部分变量缺失）
+          ./scripts/feeds update -a
+          # 只装我们需要的也可以：./scripts/feeds install openssl
+          ./scripts/feeds install -a
           make defconfig
 
-          # 编译并安装 OpenSSL 到 staging_dir（供交叉链接）
-          # 注：OpenSSL 在 SDK 的 package 树中，直接按包名编译即可
-          make package/openssl/compile V=s
+      - name: Build OpenSSL into staging_dir
+        working-directory: ${{ github.workspace }}/openwrt-sdk
+        run: |
+          # 正确目标：package/libs/openssl/compile
+          make package/libs/openssl/compile V=s
 
-          # 打印关键目录，便于后续环境变量设置
           echo "== Staging dirs =="
           ls -d $PWD/staging_dir/toolchain-* || true
           ls -d $PWD/staging_dir/target-*    || true
 
-      - name: Export SDK toolchain env (auto-detect directories)
+      - name: Export SDK toolchain env
         id: sdk
         working-directory: ${{ github.workspace }}/openwrt-sdk
         shell: bash
@@ -63,63 +80,76 @@ jobs:
           set -euo pipefail
           SDK="$PWD"
           TOOLCHAIN_DIR=$(ls -d $SDK/staging_dir/toolchain-* | head -n1)
-          TARGET_DIR=$(ls -d $SDK/staging_dir/target-* | head -n1)
-
+          TARGET_DIR=$(ls -d $SDK/staging_dir/target-*    | head -n1)
           echo "toolchain=$TOOLCHAIN_DIR" >> $GITHUB_OUTPUT
-          echo "target=$TARGET_DIR" >> $GITHUB_OUTPUT
-
-          # 交叉编译器与打包工具
+          echo "target=$TARGET_DIR"       >> $GITHUB_OUTPUT
           echo "cc=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-gcc" >> $GITHUB_OUTPUT
           echo "ar=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-ar"   >> $GITHUB_OUTPUT
+          echo "strip=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-strip" >> $GITHUB_OUTPUT
           echo "pkgcfg=$TOOLCHAIN_DIR/bin/pkg-config"                  >> $GITHUB_OUTPUT
-
-          # 供 pkg-config 查找 *.pc
           echo "pcpath=$TARGET_DIR/usr/lib/pkgconfig:$TARGET_DIR/usr/share/pkgconfig" >> $GITHUB_OUTPUT
-          echo "sysroot=$TARGET_DIR" >> $GITHUB_OUTPUT
+          echo "sysroot=$TARGET_DIR"        >> $GITHUB_OUTPUT
           echo "openssl_dir=$TARGET_DIR/usr" >> $GITHUB_OUTPUT
 
       - name: Configure Cargo for cross (aarch64-unknown-linux-musl)
         run: |
-          rustup target add aarch64-unknown-linux-musl
           mkdir -p .cargo
-          cat > .cargo/config.toml <<'CFG'
+          cat > .cargo/config.toml <<CFG
           [target.aarch64-unknown-linux-musl]
           linker = "${{ steps.sdk.outputs.cc }}"
-          ar = "${{ steps.sdk.outputs.ar }}"
-          # 对部分 crate（如 cc/openssl-sys）友好
+          ar     = "${{ steps.sdk.outputs.ar }}"
+          # 确保使用 SDK 的 sysroot
           rustflags = ["-C", "link-arg=--sysroot=${{ steps.sdk.outputs.sysroot }}"]
           CFG
+          echo "---- .cargo/config.toml ----"
+          cat .cargo/config.toml
 
-      - name: Build (tunet + tunet-service) with OpenWrt SDK toolchain
+      - name: Build (CLI only: tunet + tunet-service)
         env:
-          # 让 openssl-sys/其它依赖通过 pkg-config 在 SDK sysroot 中解析
           PKG_CONFIG_ALLOW_CROSS: "1"
           PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
           PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
           PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
-
-          # 给 openssl-sys 明确头文件/库根（SDK 已把 openssl 装进 staging）
           OPENSSL_DIR: "${{ steps.sdk.outputs.openssl_dir }}"
           OPENSSL_LIB_DIR: "${{ steps.sdk.outputs.openssl_dir }}/lib"
           OPENSSL_INCLUDE_DIR: "${{ steps.sdk.outputs.openssl_dir }}/include"
-
-          # 也可强制动态链接（默认就是动态）；若需要静态可另行设置
+          # 可选：尽量静态化 C 运行时（OpenWrt 上更稳）
           RUSTFLAGS: "-C target-feature=+crt-static"
-
         run: |
-          # 如果你只想 CLI，不含 Qt GUI，请用这行（推荐在路由器场景）：
-          cargo build --release --target aarch64-unknown-linux-musl -p tunet -p tunet-service
+          # 仅构建 CLI（不包含 Qt GUI），更适合路由器
+          cargo build --release --target aarch64-unknown-linux-musl \
+            -p tunet -p tunet-service
 
-          # 如果你想“整个 workspace 除 native”都编（会把 GUI 拉进来，OpenWrt 一般不需要）
-          # cargo build --release --target aarch64-unknown-linux-musl --workspace --exclude native
-
-      - name: Collect artifacts
+      - name: Collect, strip, checksum
+        shell: bash
         run: |
           mkdir -p dist
           cp target/aarch64-unknown-linux-musl/release/tunet         dist/tunet-openwrt-aarch64
           cp target/aarch64-unknown-linux-musl/release/tunet-service dist/tunet-service-openwrt-aarch64
+
+          echo "Before strip:"
           file dist/* || true
           ls -lh dist
+
+          # 使用 SDK 的 strip
+          "${{ steps.sdk.outputs.strip }}" dist/tunet-openwrt-aarch64 || true
+          "${{ steps.sdk.outputs.strip }}" dist/tunet-service-openwrt-aarch64 || true
+
+          echo "After strip:"
+          ls -lh dist
+
+          # 生成校验
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          echo "---- SHA256SUMS ----"
+          cat dist/SHA256SUMS.txt
+
+          # 附带 README
+          cat > dist/README.txt <<'TXT'
+          tunet / tunet-service (OpenWrt MT7981 aarch64_cortex-a53, musl)
+          - Built with OpenWrt 23.05.0 mediatek/filogic SDK
+          - Target triple: aarch64-unknown-linux-musl
+          - Recommended to run on OpenWrt 23.05.x MT7981 devices
+          TXT
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -127,7 +157,7 @@ jobs:
           name: tunet-openwrt-mt7981-aarch64
           path: dist/
 
-      - name: Release on tag
+      - name: Release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
