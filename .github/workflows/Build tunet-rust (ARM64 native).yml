@@ -1,4 +1,4 @@
-name: "Build tunet-rust for OpenWrt (MT7981 aarch64_cortex-a53)"
+name: "Build tunet-rust for OpenWrt (MT7981, no OpenSSL, musl)"
 
 on:
   workflow_dispatch:
@@ -9,10 +9,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # 你的设备：OpenWrt 23.05.0 / mediatek/mt7981 -> filogic 目标
   OPENWRT_SDK_URL: "https://downloads.openwrt.org/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
 
 jobs:
-  build-openwrt-mt7981:
+  build-openwrt-mt7981-no-openssl:
     runs-on: ubuntu-24.04
 
     steps:
@@ -53,43 +54,11 @@ jobs:
           rm -f sdk.tar.xz
           ls -lah openwrt-sdk
 
-      # 只做 defconfig；不要 install -a 以免拉到不匹配的 feeds 触发递归依赖
-      - name: "SDK defconfig (no full feeds install)"
+      # 仅 defconfig，不拉 feeds 包，避免任何 Python/openssl 依赖链
+      - name: "SDK defconfig (no feeds install)"
         working-directory: ${{ github.workspace }}/openwrt-sdk
         run: |
-          ./scripts/feeds update -a || true    # 允许失败/网络波动；SDK 自带 package/ 树
           make defconfig
-
-      # 智能定位 openssl 目标；找不到就 fall back 到 vendored OpenSSL
-      - name: "Build OpenSSL into staging_dir (smart)"
-        id: openssl
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDK="$PWD"
-
-          CORE_MK="$SDK/package/libs/openssl/Makefile"
-          FEEDS_MK="$SDK/feeds/packages/libs/openssl/Makefile"
-
-          TARGET=""
-          if [[ -f "$CORE_MK" ]]; then
-            TARGET="package/libs/openssl/compile"
-          elif [[ -f "$FEEDS_MK" ]]; then
-            TARGET="package/feeds/packages/openssl/compile"
-          fi
-
-          if [[ -n "$TARGET" ]]; then
-            echo "Using target: $TARGET"
-            make -j1 V=s "$TARGET"
-            echo "mode=staging" >> $GITHUB_OUTPUT
-          else
-            echo "::warning::OpenSSL package not found in SDK (core/feeds). Will use openssl-sys vendored mode."
-            echo "mode=vendored" >> $GITHUB_OUTPUT
-          fi
-
-          ls -d $SDK/staging_dir/toolchain-* || true
-          ls -d $SDK/staging_dir/target-*    || true
 
       - name: "Export SDK toolchain env"
         id: sdk
@@ -98,8 +67,15 @@ jobs:
         run: |
           set -euo pipefail
           SDK="$PWD"
-          TOOLCHAIN_DIR=$(ls -d $SDK/staging_dir/toolchain-* | head -n1)
-          TARGET_DIR=$(ls -d $SDK/staging_dir/target-*    | head -n1)
+          TOOLCHAIN_DIR=$(ls -d "$SDK"/staging_dir/toolchain-* | head -n1 || true)
+          TARGET_DIR=$(ls -d "$SDK"/staging_dir/target-*    | head -n1 || true)
+
+          # OpenWrt SDK 初次使用时，toolchain/target 目录可能尚未生成；触发一次空目标以准备环境
+          make tools/install toolchain/install
+
+          TOOLCHAIN_DIR=$(ls -d "$SDK"/staging_dir/toolchain-* | head -n1)
+          TARGET_DIR=$(ls -d "$SDK"/staging_dir/target-*    | head -n1)
+
           echo "toolchain=$TOOLCHAIN_DIR" >> $GITHUB_OUTPUT
           echo "target=$TARGET_DIR"       >> $GITHUB_OUTPUT
           echo "cc=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-gcc" >> $GITHUB_OUTPUT
@@ -108,7 +84,6 @@ jobs:
           echo "pkgcfg=$TOOLCHAIN_DIR/bin/pkg-config"                  >> $GITHUB_OUTPUT
           echo "pcpath=$TARGET_DIR/usr/lib/pkgconfig:$TARGET_DIR/usr/share/pkgconfig" >> $GITHUB_OUTPUT
           echo "sysroot=$TARGET_DIR"        >> $GITHUB_OUTPUT
-          echo "openssl_dir=$TARGET_DIR/usr" >> $GITHUB_OUTPUT
 
       - name: "Configure Cargo for cross (aarch64-unknown-linux-musl)"
         run: |
@@ -122,31 +97,48 @@ jobs:
           echo "---- .cargo/config.toml ----"
           cat .cargo/config.toml
 
-      - name: "Build (CLI only: tunet + tunet-service)"
+      - name: "Build (OpenSSL-free via rustls features)"
+        shell: bash
         env:
-          # 交叉构建公共设置
           PKG_CONFIG_ALLOW_CROSS: "1"
           PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
           PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
           PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
+          # 可选：尽量静态化 C 运行时（OpenWrt 上更稳）
           RUSTFLAGS: "-C target-feature=+crt-static"
-
-          # 如果上一阶段成功把 openssl 装进 staging_dir，就用它；
-          # 否则自动切换到 openssl-sys vendored
-          OPENSSL_DIR: "${{ steps.sdk.outputs.openssl_dir }}"
-          OPENSSL_LIB_DIR: "${{ steps.sdk.outputs.openssl_dir }}/lib"
-          OPENSSL_INCLUDE_DIR: "${{ steps.sdk.outputs.openssl_dir }}/include"
-          OPENSSL_STATIC: ${{ steps.openssl.outputs.mode == 'staging' && '0' || '1' }}
-          OPENSSL_NO_VENDOR: ${{ steps.openssl.outputs.mode == 'staging' && '1' || '0' }}
         run: |
-          if [[ "${{ steps.openssl.outputs.mode }}" == "vendored" ]]; then
-            echo "== Using openssl-sys vendored mode =="
-          else
-            echo "== Using SDK staged OpenSSL =="
-          fi
+          set -euo pipefail
 
-          cargo build --release --target aarch64-unknown-linux-musl \
-            -p tunet -p tunet-service
+          # 为了彻底避免 openssl，强行取消任何 OPENSSL_* 变量
+          unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_STATIC OPENSSL_NO_VENDOR
+
+          # 尝试一组常见的 rustls 特性组合（按你的仓库实际支持情况匹配，匹配一个即成功）
+          attempts=(
+            "--no-default-features --features rustls"
+            "--no-default-features --features rustls-tls"
+            "--no-default-features --features reqwest-rustls-tls"
+            "--no-default-features --features rustls-tls-native-roots"
+            "--no-default-features --features rustls-tls-webpki-roots"
+            # 如上不行，可在此添加项目实际的 feature 名
+          )
+
+          success=0
+          for feat in "${attempts[@]}"; do
+            echo "== Trying features: $feat =="
+            if cargo build --release --target aarch64-unknown-linux-musl -p tunet -p tunet-service $feat; then
+              echo "== Build succeeded with: $feat =="
+              success=1
+              break
+            else
+              echo "== Failed with: $feat =="
+            fi
+          done
+
+          if [[ $success -ne 1 ]]; then
+            echo "::error::未找到可用的 rustls 特性组合。请确认仓库的 Cargo.toml 是否提供 rustls/rustls-tls 等功能切换。"
+            echo "若仓库只能用 openssl，可选择：A) 开启 openssl-sys vendored；B) 改为 SDK 内的 openssl（我可再给你对应的工作流）。"
+            exit 2
+          fi
 
       - name: "Collect & package artifacts"
         shell: bash
@@ -168,27 +160,26 @@ jobs:
           done
 
           if [[ $found -eq 0 ]]; then
-            echo "::error::没有找到交叉编译产物。请检查构建日志。"
+            echo "::error::没有找到交叉编译产物。请检查构建日志及 feature 选择。"
             exit 1
           fi
 
           "${{ steps.sdk.outputs.strip }}" dist/* || true
-
           (cd dist && sha256sum * > SHA256SUMS.txt)
           echo "---- SHA256SUMS ----"
           cat dist/SHA256SUMS.txt
 
           cat > dist/README.txt <<'TXT'
           tunet / tunet-service for OpenWrt (MT7981 aarch64_cortex-a53, musl)
-          - Built with OpenWrt 23.05.0 mediatek/filogic SDK
+          - Built WITHOUT OpenSSL (rustls-based)
+          - Toolchain: OpenWrt 23.05.0 mediatek/filogic SDK
           - Target: aarch64-unknown-linux-musl
-          - OpenSSL: SDK staged OR openssl-sys vendored (auto)
           TXT
 
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
-          name: tunet-openwrt-mt7981-aarch64
+          name: tunet-openwrt-mt7981-aarch64-no-openssl
           path: dist/
 
       - name: "Release (on tag)"
