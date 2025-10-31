@@ -1,4 +1,4 @@
-name: "Build tunet-rust for OpenWrt (MT7981, rustls, no OpenSSL)"
+name: "Build tunet-rust for OpenWrt (MT7981 rustls no OpenSSL)"
 
 on:
   workflow_dispatch:
@@ -11,151 +11,111 @@ env:
   OPENWRT_SDK_URL: "https://downloads.openwrt.org/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
 
 jobs:
-  build-openwrt-mt7981:
+  build:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: "Checkout"
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: "Cache Cargo"
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: "Install host deps (full for OpenWrt SDK)"
+      - name: Install dependencies
         run: |
-          set -eux
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential gawk libncurses5-dev zlib1g-dev \
-            flex bison gettext xsltproc libssl-dev file \
-            unzip rsync wget curl git python3 perl \
-            ca-certificates subversion tar xz-utils zip \
-            pkg-config cmake ninja-build jq coreutils
+            build-essential gawk zlib1g-dev libncurses5-dev \
+            flex bison gettext file wget curl git python3 perl \
+            ca-certificates xz-utils unzip rsync pkg-config jq
 
-      - name: "Set up Rust (stable) + musl target"
+      - name: Set up Rust + musl
         run: |
           curl https://sh.rustup.rs -sSf | sh -s -- -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustup target add aarch64-unknown-linux-musl
           rustc -V && cargo -V
 
-      - name: "Download & extract OpenWrt SDK"
+      - name: Download OpenWrt SDK (mediatek/filogic aarch64)
         run: |
-          mkdir -p openwrt-sdk
+          mkdir openwrt-sdk
           wget -q "${OPENWRT_SDK_URL}" -O sdk.tar.xz
           tar -C openwrt-sdk --strip-components=1 -xf sdk.tar.xz
           rm -f sdk.tar.xz
           ls -lah openwrt-sdk
 
-      - name: "Prepare SDK (defconfig + build toolchain)"
-        working-directory: ${{ github.workspace }}/openwrt-sdk
+      - name: Export SDK environment
+        id: sdk
         run: |
           set -eux
-          make defconfig
-          # 单核构建 tools 确保日志清晰
-          make -j1 V=sc tools/install
-          make -j$(nproc) V=sc toolchain/install
-          ls -d staging_dir/toolchain-* staging_dir/target-* || true
-
-      - name: "Export SDK toolchain env"
-        id: sdk
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDK="$PWD"
+          SDK=$PWD/openwrt-sdk
           TOOLCHAIN_DIR=$(ls -d $SDK/staging_dir/toolchain-* | head -n1)
-          TARGET_DIR=$(ls -d $SDK/staging_dir/target-*    | head -n1)
+          TARGET_DIR=$(ls -d $SDK/staging_dir/target-* | head -n1)
           echo "toolchain=$TOOLCHAIN_DIR" >> $GITHUB_OUTPUT
-          echo "target=$TARGET_DIR"       >> $GITHUB_OUTPUT
+          echo "target=$TARGET_DIR" >> $GITHUB_OUTPUT
           echo "cc=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-gcc" >> $GITHUB_OUTPUT
-          echo "ar=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-ar"   >> $GITHUB_OUTPUT
+          echo "ar=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-ar" >> $GITHUB_OUTPUT
           echo "strip=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-strip" >> $GITHUB_OUTPUT
-          echo "pkgcfg=$TOOLCHAIN_DIR/bin/pkg-config"                  >> $GITHUB_OUTPUT
+          echo "sysroot=$TARGET_DIR" >> $GITHUB_OUTPUT
           echo "pcpath=$TARGET_DIR/usr/lib/pkgconfig:$TARGET_DIR/usr/share/pkgconfig" >> $GITHUB_OUTPUT
-          echo "sysroot=$TARGET_DIR"        >> $GITHUB_OUTPUT
+          echo "pkgcfg=$TOOLCHAIN_DIR/bin/pkg-config" >> $GITHUB_OUTPUT
 
-      - name: "Configure Cargo for cross (aarch64-unknown-linux-musl)"
+      - name: Configure Cargo cross toolchain
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml <<CFG
           [target.aarch64-unknown-linux-musl]
           linker = "${{ steps.sdk.outputs.cc }}"
-          ar     = "${{ steps.sdk.outputs.ar }}"
+          ar = "${{ steps.sdk.outputs.ar }}"
           rustflags = ["-C", "link-arg=--sysroot=${{ steps.sdk.outputs.sysroot }}"]
           CFG
           cat .cargo/config.toml
 
-      - name: "Build (rustls, no OpenSSL)"
-        shell: bash
+      - name: Build (rustls, no OpenSSL)
         env:
           PKG_CONFIG_ALLOW_CROSS: "1"
           PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
-          PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
           PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
+          PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
-          set -euo pipefail
+          set -eux
           unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_STATIC OPENSSL_NO_VENDOR
-          echo "== 构建 tunet / tunet-service (rustls)=="
-
-          # 尝试 rustls / rustls-tls / reqwest-rustls-tls
+          echo "== 尝试 rustls 编译 =="
           attempts=(
             "--no-default-features --features rustls"
             "--no-default-features --features rustls-tls"
             "--no-default-features --features reqwest-rustls-tls"
             "--no-default-features --features rustls-tls-webpki-roots"
           )
-
           ok=0
           for feat in "${attempts[@]}"; do
-            echo "尝试编译: $feat"
             if cargo build --release --target aarch64-unknown-linux-musl -p tunet -p tunet-service $feat; then
-              echo "成功: $feat"
               ok=1
+              echo "✅ 成功构建 $feat"
               break
             fi
           done
-
           if [[ $ok -eq 0 ]]; then
-            echo "::error::所有 rustls 特性均构建失败。请检查 Cargo.toml 是否支持 rustls/rustls-tls。"
-            exit 2
+            echo "::error::rustls 编译失败，请检查 Cargo.toml 特性命名"
+            exit 1
           fi
 
-      - name: "Collect & package artifacts"
-        shell: bash
+      - name: Package artifacts
         run: |
-          set -euo pipefail
           mkdir -p dist
-          cp target/aarch64-unknown-linux-musl/release/tunet         dist/tunet-openwrt-aarch64
+          cp target/aarch64-unknown-linux-musl/release/tunet dist/tunet-openwrt-aarch64
           cp target/aarch64-unknown-linux-musl/release/tunet-service dist/tunet-service-openwrt-aarch64
           "${{ steps.sdk.outputs.strip }}" dist/* || true
           (cd dist && sha256sum * > SHA256SUMS.txt)
-          echo "---- dist ----"
           ls -lh dist
           cat dist/SHA256SUMS.txt
-          cat > dist/README.txt <<'TXT'
-          tunet / tunet-service for OpenWrt (MT7981, rustls, no OpenSSL)
-          - OpenWrt SDK: 23.05.0 mediatek/filogic
-          - Target: aarch64-unknown-linux-musl
-          - TLS: rustls (no OpenSSL)
-          TXT
+          echo "Build complete"
 
-      - name: "Upload artifacts"
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tunet-openwrt-mt7981-aarch64-rustls
           path: dist/
 
-      - name: "Release (on tag)"
+      - name: Release on tag
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
