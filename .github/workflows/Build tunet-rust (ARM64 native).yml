@@ -1,4 +1,4 @@
-name: Build tunet-rust (ARM64 + Qt5)
+name: Build tunet-rust for OpenWrt (MT7981 aarch64_cortex-a53)
 
 on:
   workflow_dispatch:
@@ -11,66 +11,123 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-arm64-qt5:
-    name: ARM64 (Ubuntu 22.04) Qt5 build
-    runs-on: ubuntu-22.04-arm
+  build-openwrt-mt7981:
+    # 用 x86_64 主机跑 OpenWrt 官方 SDK（SDK 本身就是 x86_64 Linux）
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache Cargo registry/git/target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-arm64-cargo-
-
-      - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install build dependencies (OpenSSL, Qt5, toolchain)
+      - name: Install host deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config libssl-dev \
-            qtbase5-dev qtbase5-dev-tools qtchooser qt5-qmake \
-            qttools5-dev qttools5-dev-tools \
-            libgl1-mesa-dev
-          # 验证 qmake 可用且是 Qt5
-          qmake -v || true
-          which qmake || true
+          sudo apt-get install -y build-essential wget tar xz-utils \
+              python3 pkg-config cmake ninja-build \
+              musl-tools git curl unzip
 
-      # 重要：让 winio-ui-qt 的 build.rs 明确找到 Qt5 的 qmake
-      - name: Build (Qt5 + whole workspace, exclude native)
-        env:
-          QT_VERSION_MAJOR: "5"
-          QMAKE: qmake
-          RUST_BACKTRACE: "1"
+      - name: Download OpenWrt SDK (23.05.0 mediatek/filogic)
         run: |
-          cargo build --release --workspace --exclude native
+          # 任选一个镜像；这里用 C3SL 镜像（与官方目录一致）
+          SDK_URL="https://openwrt.c3sl.ufpr.br/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+          wget -q $SDK_URL -O sdk.tar.xz
+          mkdir -p $GITHUB_WORKSPACE/openwrt-sdk
+          tar -C $GITHUB_WORKSPACE/openwrt-sdk --strip-components=1 -xf sdk.tar.xz
+          rm -f sdk.tar.xz
 
-      - name: Strip & package
+      - name: Show SDK tree
+        run: |
+          ls -lah $GITHUB_WORKSPACE/openwrt-sdk
+          echo "OpenWrt SDK ready"
+
+      - name: Prepare SDK & build OpenSSL for staging
+        working-directory: ${{ github.workspace }}/openwrt-sdk
+        run: |
+          # 让 SDK 生成默认 .config（避免部分变量缺失）
+          make defconfig
+
+          # 编译并安装 OpenSSL 到 staging_dir（供交叉链接）
+          # 注：OpenSSL 在 SDK 的 package 树中，直接按包名编译即可
+          make package/openssl/compile V=s
+
+          # 打印关键目录，便于后续环境变量设置
+          echo "== Staging dirs =="
+          ls -d $PWD/staging_dir/toolchain-* || true
+          ls -d $PWD/staging_dir/target-*    || true
+
+      - name: Export SDK toolchain env (auto-detect directories)
+        id: sdk
+        working-directory: ${{ github.workspace }}/openwrt-sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$PWD"
+          TOOLCHAIN_DIR=$(ls -d $SDK/staging_dir/toolchain-* | head -n1)
+          TARGET_DIR=$(ls -d $SDK/staging_dir/target-* | head -n1)
+
+          echo "toolchain=$TOOLCHAIN_DIR" >> $GITHUB_OUTPUT
+          echo "target=$TARGET_DIR" >> $GITHUB_OUTPUT
+
+          # 交叉编译器与打包工具
+          echo "cc=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-gcc" >> $GITHUB_OUTPUT
+          echo "ar=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-ar"   >> $GITHUB_OUTPUT
+          echo "pkgcfg=$TOOLCHAIN_DIR/bin/pkg-config"                  >> $GITHUB_OUTPUT
+
+          # 供 pkg-config 查找 *.pc
+          echo "pcpath=$TARGET_DIR/usr/lib/pkgconfig:$TARGET_DIR/usr/share/pkgconfig" >> $GITHUB_OUTPUT
+          echo "sysroot=$TARGET_DIR" >> $GITHUB_OUTPUT
+          echo "openssl_dir=$TARGET_DIR/usr" >> $GITHUB_OUTPUT
+
+      - name: Configure Cargo for cross (aarch64-unknown-linux-musl)
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'CFG'
+          [target.aarch64-unknown-linux-musl]
+          linker = "${{ steps.sdk.outputs.cc }}"
+          ar = "${{ steps.sdk.outputs.ar }}"
+          # 对部分 crate（如 cc/openssl-sys）友好
+          rustflags = ["-C", "link-arg=--sysroot=${{ steps.sdk.outputs.sysroot }}"]
+          CFG
+
+      - name: Build (tunet + tunet-service) with OpenWrt SDK toolchain
+        env:
+          # 让 openssl-sys/其它依赖通过 pkg-config 在 SDK sysroot 中解析
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
+          PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
+          PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
+
+          # 给 openssl-sys 明确头文件/库根（SDK 已把 openssl 装进 staging）
+          OPENSSL_DIR: "${{ steps.sdk.outputs.openssl_dir }}"
+          OPENSSL_LIB_DIR: "${{ steps.sdk.outputs.openssl_dir }}/lib"
+          OPENSSL_INCLUDE_DIR: "${{ steps.sdk.outputs.openssl_dir }}/include"
+
+          # 也可强制动态链接（默认就是动态）；若需要静态可另行设置
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+        run: |
+          # 如果你只想 CLI，不含 Qt GUI，请用这行（推荐在路由器场景）：
+          cargo build --release --target aarch64-unknown-linux-musl -p tunet -p tunet-service
+
+          # 如果你想“整个 workspace 除 native”都编（会把 GUI 拉进来，OpenWrt 一般不需要）
+          # cargo build --release --target aarch64-unknown-linux-musl --workspace --exclude native
+
+      - name: Collect artifacts
         run: |
           mkdir -p dist
-          # 可选：strip 以减小体积（不影响运行）
-          find target/release -maxdepth 1 -type f -executable -exec file {} \; | awk -F: '/ELF 64-bit LSB executable/ {print $1}' | while read -r bin; do
-            cp "$bin" "dist/$(basename "$bin")-aarch64"
-          done
+          cp target/aarch64-unknown-linux-musl/release/tunet         dist/tunet-openwrt-aarch64
+          cp target/aarch64-unknown-linux-musl/release/tunet-service dist/tunet-service-openwrt-aarch64
+          file dist/* || true
           ls -lh dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tunet-rust-arm64-qt5
+          name: tunet-openwrt-mt7981-aarch64
           path: dist/
 
-      # Tag 推送时自动发布 Release 并附带二进制
-      - name: Release (on tag)
+      - name: Release on tag
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
