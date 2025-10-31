@@ -1,4 +1,4 @@
-name: "Build tunet-rust for OpenWrt (MT7981, SDK OpenSSL)"
+name: "Build tunet-rust for OpenWrt (MT7981, vendored OpenSSL, static)"
 
 on:
   workflow_dispatch:
@@ -28,13 +28,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: "Install host deps"
+      - name: "Install host deps (vendored OpenSSL needs perl/make etc.)"
         run: |
           set -eux
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential gawk zlib1g-dev libncurses5-dev \
-            flex bison gettext xsltproc file \
+            flex bison gettext file \
             unzip rsync wget curl git python3 perl \
             ca-certificates xz-utils tar zip \
             pkg-config cmake ninja-build jq coreutils
@@ -46,7 +46,7 @@ jobs:
           rustup target add aarch64-unknown-linux-musl
           rustc -V && cargo -V
 
-      - name: "Download OpenWrt SDK (mediatek/filogic)"
+      - name: "Download OpenWrt SDK (linker/sysroot only)"
         run: |
           mkdir -p openwrt-sdk
           wget -q "${OPENWRT_SDK_URL}" -O sdk.tar.xz
@@ -54,81 +54,44 @@ jobs:
           rm -f sdk.tar.xz
           ls -lah openwrt-sdk
 
-      - name: "SDK defconfig (no feeds install)"
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        run: |
-          set -eux
-          make defconfig
-
-      - name: "Build OpenSSL into staging_dir"
-        id: openssl
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDK="$PWD"
-          CORE_MK="$SDK/package/libs/openssl/Makefile"
-          FEEDS_MK="$SDK/feeds/packages/libs/openssl/Makefile"
-          if [[ -f "$CORE_MK" ]]; then
-            PKG="package/libs/openssl"
-          elif [[ -f "$FEEDS_MK" ]]; then
-            PKG="package/feeds/packages/openssl"
-          else
-            echo "::error::OpenSSL Makefile not found in SDK (core/feeds)."
-            exit 2
-          fi
-          echo "Using OpenSSL pkg: $PKG"
-          make -j1 V=sc ${PKG}/prepare
-          make -j1 V=sc ${PKG}/compile
-          make -j1 V=sc ${PKG}/install
-
-          TARGET_DIR=$(ls -d "$SDK"/staging_dir/target-* | head -n1)
-          test -f "$TARGET_DIR/usr/include/openssl/ssl.h"
-          ls "$TARGET_DIR/usr/lib"/libssl.* >/dev/null 2>&1
-
-          echo "target=$TARGET_DIR" >> $GITHUB_OUTPUT
-
       - name: "Export SDK toolchain env"
         id: sdk
-        working-directory: ${{ github.workspace }}/openwrt-sdk
-        shell: bash
         run: |
-          set -euo pipefail
-          SDK="$PWD"
+          set -eux
+          SDK=$PWD/openwrt-sdk
           TOOLCHAIN_DIR=$(ls -d $SDK/staging_dir/toolchain-* | head -n1)
-          TARGET_DIR=$(ls -d $SDK/staging_dir/target-*    | head -n1)
+          TARGET_DIR=$(ls -d $SDK/staging_dir/target-* | head -n1)
           echo "toolchain=$TOOLCHAIN_DIR" >> $GITHUB_OUTPUT
-          echo "target=$TARGET_DIR"       >> $GITHUB_OUTPUT
+          echo "target=$TARGET_DIR" >> $GITHUB_OUTPUT
           echo "cc=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-gcc" >> $GITHUB_OUTPUT
-          echo "ar=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-ar"   >> $GITHUB_OUTPUT
+          echo "ar=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-ar" >> $GITHUB_OUTPUT
           echo "strip=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-strip" >> $GITHUB_OUTPUT
-          echo "pkgcfg=$TOOLCHAIN_DIR/bin/pkg-config"                  >> $GITHUB_OUTPUT
-          echo "pcpath=$TARGET_DIR/usr/lib/pkgconfig:$TARGET_DIR/usr/share/pkgconfig" >> $GITHUB_OUTPUT
-          echo "sysroot=$TARGET_DIR"        >> $GITHUB_OUTPUT
-          echo "openssl_dir=$TARGET_DIR/usr" >> $GITHUB_OUTPUT
+          echo "sysroot=$TARGET_DIR" >> $GITHUB_OUTPUT
 
-      - name: "Configure Cargo for cross"
+      - name: "Configure Cargo for cross (musl, static)"
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml <<CFG
           [target.aarch64-unknown-linux-musl]
           linker = "${{ steps.sdk.outputs.cc }}"
           ar     = "${{ steps.sdk.outputs.ar }}"
-          rustflags = ["-C", "link-arg=--sysroot=${{ steps.sdk.outputs.sysroot }}"]
+          rustflags = [
+            "-C", "link-arg=--sysroot=${{ steps.sdk.outputs.sysroot }}",
+            "-C", "target-feature=+crt-static"
+          ]
           CFG
           cat .cargo/config.toml
 
-      - name: "Build (with SDK OpenSSL)"
+      - name: "Build (vendored OpenSSL, fully static)"
         env:
-          PKG_CONFIG_ALLOW_CROSS: "1"
-          PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
-          PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
-          PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
-          OPENSSL_DIR: "${{ steps.sdk.outputs.openssl_dir }}"
-          OPENSSL_LIB_DIR: "${{ steps.sdk.outputs.openssl_dir }}/lib"
-          OPENSSL_INCLUDE_DIR: "${{ steps.sdk.outputs.openssl_dir }}/include"
+          # 关键：强制使用 openssl-sys vendored，并静态链接
+          OPENSSL_NO_VENDOR: "0"
+          OPENSSL_STATIC: "1"
+          # 一些 crate 在 musl + static 下需要 libunwind；如遇链接错误，可启用下一行：
+          # RUSTFLAGS: "-C link-args=-static -Clink-arg=-Wl,--as-needed"
         run: |
           set -eux
+          unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR
           cargo build --release --target aarch64-unknown-linux-musl \
             -p tunet -p tunet-service
 
@@ -136,8 +99,8 @@ jobs:
         run: |
           set -eux
           mkdir -p dist
-          cp target/aarch64-unknown-linux-musl/release/tunet         dist/tunet-openwrt-aarch64
-          cp target/aarch64-unknown-linux-musl/release/tunet-service dist/tunet-service-openwrt-aarch64
+          cp target/aarch64-unknown-linux-musl/release/tunet         dist/tunet-openwrt-aarch64-static
+          cp target/aarch64-unknown-linux-musl/release/tunet-service dist/tunet-service-openwrt-aarch64-static
           "${{ steps.sdk.outputs.strip }}" dist/* || true
           (cd dist && sha256sum * > SHA256SUMS.txt)
           ls -lh dist
@@ -146,7 +109,7 @@ jobs:
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
-          name: tunet-openwrt-mt7981-aarch64
+          name: tunet-openwrt-mt7981-aarch64-static
           path: dist/
 
       - name: "Release on tag"
