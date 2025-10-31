@@ -1,19 +1,17 @@
-name: "Build tunet-rust for OpenWrt (MT7981, no OpenSSL, musl)"
+name: "Build tunet-rust for OpenWrt (MT7981, rustls, no OpenSSL)"
 
 on:
   workflow_dispatch:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
-  # 你的设备：OpenWrt 23.05.0 / mediatek/mt7981 -> filogic 目标
   OPENWRT_SDK_URL: "https://downloads.openwrt.org/releases/23.05.0/targets/mediatek/filogic/openwrt-sdk-23.05.0-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
 
 jobs:
-  build-openwrt-mt7981-no-openssl:
+  build-openwrt-mt7981:
     runs-on: ubuntu-24.04
 
     steps:
@@ -31,13 +29,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: "Install host deps"
+      - name: "Install host deps (full for OpenWrt SDK)"
         run: |
+          set -eux
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential wget curl xz-utils tar rsync \
-            python3 pkg-config cmake ninja-build perl \
-            git unzip jq coreutils file
+            build-essential gawk libncurses5-dev zlib1g-dev \
+            flex bison gettext xsltproc libssl-dev file \
+            unzip rsync wget curl git python3 perl \
+            ca-certificates subversion tar xz-utils zip \
+            pkg-config cmake ninja-build jq coreutils
 
       - name: "Set up Rust (stable) + musl target"
         run: |
@@ -54,11 +55,15 @@ jobs:
           rm -f sdk.tar.xz
           ls -lah openwrt-sdk
 
-      # 仅 defconfig，不拉 feeds 包，避免任何 Python/openssl 依赖链
-      - name: "SDK defconfig (no feeds install)"
+      - name: "Prepare SDK (defconfig + build toolchain)"
         working-directory: ${{ github.workspace }}/openwrt-sdk
         run: |
+          set -eux
           make defconfig
+          # 单核构建 tools 确保日志清晰
+          make -j1 V=sc tools/install
+          make -j$(nproc) V=sc toolchain/install
+          ls -d staging_dir/toolchain-* staging_dir/target-* || true
 
       - name: "Export SDK toolchain env"
         id: sdk
@@ -67,15 +72,8 @@ jobs:
         run: |
           set -euo pipefail
           SDK="$PWD"
-          TOOLCHAIN_DIR=$(ls -d "$SDK"/staging_dir/toolchain-* | head -n1 || true)
-          TARGET_DIR=$(ls -d "$SDK"/staging_dir/target-*    | head -n1 || true)
-
-          # OpenWrt SDK 初次使用时，toolchain/target 目录可能尚未生成；触发一次空目标以准备环境
-          make tools/install toolchain/install
-
-          TOOLCHAIN_DIR=$(ls -d "$SDK"/staging_dir/toolchain-* | head -n1)
-          TARGET_DIR=$(ls -d "$SDK"/staging_dir/target-*    | head -n1)
-
+          TOOLCHAIN_DIR=$(ls -d $SDK/staging_dir/toolchain-* | head -n1)
+          TARGET_DIR=$(ls -d $SDK/staging_dir/target-*    | head -n1)
           echo "toolchain=$TOOLCHAIN_DIR" >> $GITHUB_OUTPUT
           echo "target=$TARGET_DIR"       >> $GITHUB_OUTPUT
           echo "cc=$TOOLCHAIN_DIR/bin/aarch64-openwrt-linux-musl-gcc" >> $GITHUB_OUTPUT
@@ -94,49 +92,41 @@ jobs:
           ar     = "${{ steps.sdk.outputs.ar }}"
           rustflags = ["-C", "link-arg=--sysroot=${{ steps.sdk.outputs.sysroot }}"]
           CFG
-          echo "---- .cargo/config.toml ----"
           cat .cargo/config.toml
 
-      - name: "Build (OpenSSL-free via rustls features)"
+      - name: "Build (rustls, no OpenSSL)"
         shell: bash
         env:
           PKG_CONFIG_ALLOW_CROSS: "1"
           PKG_CONFIG: "${{ steps.sdk.outputs.pkgcfg }}"
           PKG_CONFIG_SYSROOT_DIR: "${{ steps.sdk.outputs.sysroot }}"
           PKG_CONFIG_PATH: "${{ steps.sdk.outputs.pcpath }}"
-          # 可选：尽量静态化 C 运行时（OpenWrt 上更稳）
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           set -euo pipefail
-
-          # 为了彻底避免 openssl，强行取消任何 OPENSSL_* 变量
           unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_STATIC OPENSSL_NO_VENDOR
+          echo "== 构建 tunet / tunet-service (rustls)=="
 
-          # 尝试一组常见的 rustls 特性组合（按你的仓库实际支持情况匹配，匹配一个即成功）
+          # 尝试 rustls / rustls-tls / reqwest-rustls-tls
           attempts=(
             "--no-default-features --features rustls"
             "--no-default-features --features rustls-tls"
             "--no-default-features --features reqwest-rustls-tls"
-            "--no-default-features --features rustls-tls-native-roots"
             "--no-default-features --features rustls-tls-webpki-roots"
-            # 如上不行，可在此添加项目实际的 feature 名
           )
 
-          success=0
+          ok=0
           for feat in "${attempts[@]}"; do
-            echo "== Trying features: $feat =="
+            echo "尝试编译: $feat"
             if cargo build --release --target aarch64-unknown-linux-musl -p tunet -p tunet-service $feat; then
-              echo "== Build succeeded with: $feat =="
-              success=1
+              echo "成功: $feat"
+              ok=1
               break
-            else
-              echo "== Failed with: $feat =="
             fi
           done
 
-          if [[ $success -ne 1 ]]; then
-            echo "::error::未找到可用的 rustls 特性组合。请确认仓库的 Cargo.toml 是否提供 rustls/rustls-tls 等功能切换。"
-            echo "若仓库只能用 openssl，可选择：A) 开启 openssl-sys vendored；B) 改为 SDK 内的 openssl（我可再给你对应的工作流）。"
+          if [[ $ok -eq 0 ]]; then
+            echo "::error::所有 rustls 特性均构建失败。请检查 Cargo.toml 是否支持 rustls/rustls-tls。"
             exit 2
           fi
 
@@ -145,41 +135,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-
-          bins=(
-            "target/aarch64-unknown-linux-musl/release/tunet"
-            "target/aarch64-unknown-linux-musl/release/tunet-service"
-          )
-
-          found=0
-          for b in "${bins[@]}"; do
-            if [[ -x "$b" ]]; then
-              cp "$b" "dist/$(basename "$b")-openwrt-aarch64"
-              ((found++)) || true
-            fi
-          done
-
-          if [[ $found -eq 0 ]]; then
-            echo "::error::没有找到交叉编译产物。请检查构建日志及 feature 选择。"
-            exit 1
-          fi
-
+          cp target/aarch64-unknown-linux-musl/release/tunet         dist/tunet-openwrt-aarch64
+          cp target/aarch64-unknown-linux-musl/release/tunet-service dist/tunet-service-openwrt-aarch64
           "${{ steps.sdk.outputs.strip }}" dist/* || true
           (cd dist && sha256sum * > SHA256SUMS.txt)
-          echo "---- SHA256SUMS ----"
+          echo "---- dist ----"
+          ls -lh dist
           cat dist/SHA256SUMS.txt
-
           cat > dist/README.txt <<'TXT'
-          tunet / tunet-service for OpenWrt (MT7981 aarch64_cortex-a53, musl)
-          - Built WITHOUT OpenSSL (rustls-based)
-          - Toolchain: OpenWrt 23.05.0 mediatek/filogic SDK
+          tunet / tunet-service for OpenWrt (MT7981, rustls, no OpenSSL)
+          - OpenWrt SDK: 23.05.0 mediatek/filogic
           - Target: aarch64-unknown-linux-musl
+          - TLS: rustls (no OpenSSL)
           TXT
 
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
-          name: tunet-openwrt-mt7981-aarch64-no-openssl
+          name: tunet-openwrt-mt7981-aarch64-rustls
           path: dist/
 
       - name: "Release (on tag)"
